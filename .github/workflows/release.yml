@@ -1,65 +1,140 @@
 name: Build and release
+
 on:
-  # Runs automatically when a tag beginning with 'v' (i.e. a versioned release) is pushed.
-  push:
-    tags:
-      - v*
-    branches: [main]
-  pull_request:
-    branches: [main]
+    # Runs automatically when a tag beginning with 'v' (i.e. a versioned release) is pushed.
+    push:
+        tags:
+        - 'v*.*.*'
+    # The pull_request and branches triggers are for testing purposes
+    # and will not create a release.
+    pull_request:
+        branches: [main]
+    workflow_dispatch:
+
+env:
+    GO111MODULE: "auto"
+
+# Permissions are set at the workflow level to ensure all jobs inherit them
+permissions:
+    contents: write
+    packages: write
 
 jobs:
-  build-release:
-    runs-on: ubuntu-20.04
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/setup-go@v4
-        with:
-          go-version: '1.21.4'
+    build-release:
+        name: Build Multi-platform Binaries
+        runs-on: ubuntu-latest
+        strategy:
+            matrix:
+                os: [linux, darwin]
+                arch: [amd64, arm64]
 
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
+        # Permissions are set at the job level for fine-grained control
+        permissions:
+            contents: read
 
-      - name: build binary
-        run: go build
+        steps:
+        - name: Checkout Code
+          uses: actions/checkout@v4
 
-      - name: install nfpm
-        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.15.1
+        - name: Set up Go
+          uses: actions/setup-go@v5
+          with:
+              go-version: '1.22'
 
-      - name: build deb
-        run: nfpm package -p deb -t unbound_exporter.deb
+        - name: Build Binary
+          run: |
+              # The CGO_ENABLED=0 is important for creating statically linked binaries
+              # The binary is named 'unbound_exporter' for easier handling by nfpm
+              CGO_ENABLED=0 GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} go build -ldflags "-s -w" -o unbound_exporter
 
-      - name: upload deb
-        uses: actions/upload-artifact@v3
-        with:
-          name: unbound_exporter deb artifact
-          path: unbound_exporter.deb
+        - name: Rename Binary for Release
+          run: |
+              # Rename the binary with the platform and architecture for a unique name
+              mv unbound_exporter unbound_exporter_${{ matrix.os }}_${{ matrix.arch }}
 
-  push-release:
-    if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
-    needs: build-release
-    runs-on: ubuntu-20.04
-    # Overrides the org default of 'read'. This allows us to upload and post the
-    # resulting package file as part of a release.
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v2
-        with:
-          persist-credentials: false
+        - name: Build and Package .deb for Linux
+          if: matrix.os == 'linux' && matrix.arch == 'amd64'
+          run: |
+              # Install nfpm to package the .deb file
+              go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.15.1
+              # The nfpm command is looking for the binary to package
+              # so we will use the original name and then rename the binary for release
+              cp unbound_exporter_${{ matrix.os }}_${{ matrix.arch }} unbound_exporter
+              nfpm package -p deb -t unbound_exporter.deb
 
-      - name: Download release artifact
-        uses: actions/download-artifact@v3
-        with:
-          name: unbound_exporter deb artifact
+        - name: Upload Binary Artifact
+          uses: actions/upload-artifact@v4
+          with:
+              # The artifact name is now unique to each job, resolving the conflict
+              name: unbound-exporter-binaries-${{ matrix.os }}-${{ matrix.arch }}
+              path: unbound_exporter_${{ matrix.os }}_${{ matrix.arch }}
+              if-no-files-found: error
 
-      - name: rename
-        run: mv unbound_exporter.deb unbound_exporter-${GITHUB_REF_NAME}.x86_64.deb
+        - name: Upload .deb Artifact
+          if: matrix.os == 'linux' && matrix.arch == 'amd64'
+          uses: actions/upload-artifact@v4
+          with:
+              # A unique artifact name for the .deb file
+              name: unbound-exporter-deb-${{ matrix.arch }}
+              path: unbound_exporter.deb
+              if-no-files-found: error
 
-      - name: push release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # https://cli.github.com/manual/gh_release_create
-        run: gh release create "${GITHUB_REF_NAME}" unbound_exporter-${GITHUB_REF_NAME}.x86_64.deb
+    push-release:
+        name: Publish Docker Image and Release
+        runs-on: ubuntu-latest
+        # This job now depends on the build-release job to complete successfully
+        needs: build-release
+        # This job only runs on a successful push of a release tag
+        if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
+        permissions:
+            contents: write # Allows creating a release and uploading assets
+            packages: write # Allows pushing to GHCR
+
+        steps:
+        - name: Checkout Code
+          uses: actions/checkout@v4
+          with:
+              fetch-depth: 0 # Fetch all history to get the tag message
+
+        - name: Get tag name
+          id: get_tag
+          run: echo "TAG_NAME=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+        - name: Get Tag Message
+          id: get_tag_message
+          run: |
+              TAG_MESSAGE=$(git tag -n --points-at ${{ github.ref }} | sed 's/^[^[:space:]]*[[:space:]]*//')
+              echo "TAG_MESSAGE=${TAG_MESSAGE}" >> $GITHUB_OUTPUT
+
+        - name: Set up Docker Buildx
+          uses: docker/setup-buildx-action@v3
+
+        - name: Log in to GitHub Container Registry
+          uses: docker/login-action@v3
+          with:
+              registry: ghcr.io
+              username: ${{ github.actor }}
+              password: ${{ secrets.GITHUB_TOKEN }}
+
+        - name: Build and Push Docker Image
+          uses: docker/build-push-action@v5
+          with:
+              context: .
+              # Builds the image for both amd64 and arm64 platforms
+              platforms: linux/amd64,linux/arm64
+              push: true
+              tags: ghcr.io/masudur-rahman/unbound_exporter:${{ steps.get_tag.outputs.TAG_NAME }}
+
+        - name: Download all workflow artifacts
+          uses: actions/download-artifact@v4
+          with:
+              path: artifacts
+
+        - name: Create GitHub Release
+          uses: softprops/action-gh-release@v1
+          with:
+              # The glob pattern is updated to match the raw binary files
+              files: artifacts/*/*
+              body: ${{ steps.get_tag_message.outputs.TAG_MESSAGE || 'A new release is available.' }}
+              draft: false
+              prerelease: false
